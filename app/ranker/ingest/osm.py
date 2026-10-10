@@ -10,14 +10,14 @@ import httpx
 from ..config import Settings
 
 SUBSTATION_QUERY = """
-[out:json][timeout:180];
+[out:json][timeout:90][maxsize:268435456];
 nwr["power"="substation"]["voltage"~"^[0-9]{{5,}}"]({south},{west},{north},{east});
 out center tags;
 """
 
 # Voltage tags are in volts. Six or more leading digits means 100 kV and up.
 LINE_QUERY = """
-[out:json][timeout:180];
+[out:json][timeout:90][maxsize:268435456];
 way["power"="line"]["voltage"~"^[1-9][0-9]{{5}}"]({south},{west},{north},{east});
 out geom tags;
 """
@@ -100,7 +100,13 @@ def run_overpass(query: str, urls: tuple, attempts: int = 3) -> list:
             try:
                 response = httpx.post(url, data={"data": query}, headers=OVERPASS_HEADERS, timeout=240)
                 response.raise_for_status()
-                return response.json().get("elements", [])
+                payload = response.json()
+                # Overpass answers HTTP 200 with a "remark" when a query timed out or ran out of memory,
+                # and the elements are then partial or empty. Treat that as a failure, not as an empty tile.
+                remark = str(payload.get("remark", ""))
+                if "runtime error" in remark.lower():
+                    raise ValueError(remark)
+                return payload.get("elements", [])
             except (httpx.HTTPError, ValueError) as error:
                 last_error = error
                 body = getattr(getattr(error, "response", None), "text", "")[:200]
@@ -109,14 +115,25 @@ def run_overpass(query: str, urls: tuple, attempts: int = 3) -> list:
     raise RuntimeError(f"Overpass failed after {attempts} rounds: {last_error}")
 
 
-def fetch_or_skip(query: str, urls: tuple, label: str, failed: list) -> list:
-    """Run one tile query. A tile that keeps failing is recorded and skipped instead of aborting the run."""
+def fetch_or_skip(query: str, urls: tuple, label: str, failed: list):
+    """Run one tile query. Returns None (and records the label) if it keeps failing, so the run continues."""
     try:
         return run_overpass(query, urls)
     except RuntimeError as error:
         print(f"  SKIPPED {label}: {error}")
         failed.append(label)
-        return []
+        return None
+
+
+def tile_done(connection, key: str) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT 1 FROM osm_tiles_done WHERE tile_key = %s", (key,))
+        return cursor.fetchone() is not None
+
+
+def mark_tile_done(connection, key: str) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute("INSERT INTO osm_tiles_done (tile_key) VALUES (%s) ON CONFLICT DO NOTHING", (key,))
 
 
 def state_bbox(connection, state_fips: str) -> tuple:
@@ -135,20 +152,23 @@ def state_bbox(connection, state_fips: str) -> tuple:
     return row["south"], row["west"], row["north"], row["east"]
 
 
-def ingest_osm(connection, settings: Settings) -> tuple:
-    south, west, north, east = state_bbox(connection, settings.state_fips)
-    tiles = make_tiles(south, west, north, east, settings.overpass_tiles)
-    substation_total = 0
-    line_total = 0
-    failed = []
-    for number, (t_south, t_west, t_north, t_east) in enumerate(tiles, start=1):
-        print(f"Tile {number}/{len(tiles)}")
-        bounds = dict(south=t_south, west=t_west, north=t_north, east=t_east)
+def load_tile(connection, settings: Settings, kind: str, number: int, query: str, failed: list) -> int:
+    """Fetch one tile query and upsert its rows. Tiles that already succeeded are skipped.
 
-        substation_elements = fetch_or_skip(
-            SUBSTATION_QUERY.format(**bounds), settings.overpass_urls, f"tile {number} substations", failed)
-        with connection.cursor() as cursor:
-            for element in substation_elements:
+    Returns the number of rows written. A failed fetch is recorded in `failed` and not marked done,
+    so the next run retries exactly that tile.
+    """
+    key = f"{settings.state_fips}:{settings.overpass_tiles}:{kind}:{number}"
+    if tile_done(connection, key):
+        print(f"  {kind} already loaded, skipping")
+        return 0
+    elements = fetch_or_skip(query, settings.overpass_urls, f"tile {number} {kind}", failed)
+    if elements is None:
+        return 0
+    written = 0
+    with connection.cursor() as cursor:
+        for element in elements:
+            if kind == "substations":
                 row = element_to_substation(element, settings.min_substation_kv)
                 if row is None:
                     continue
@@ -163,14 +183,7 @@ def ingest_osm(connection, settings: Settings) -> tuple:
                     """,
                     (osm_id, name, operator, max_kv, lon, lat),
                 )
-                substation_total += 1
-        connection.commit()
-        time.sleep(2)  # be polite to the public server
-
-        line_elements = fetch_or_skip(
-            LINE_QUERY.format(**bounds), settings.overpass_urls, f"tile {number} lines", failed)
-        with connection.cursor() as cursor:
-            for element in line_elements:
+            else:
                 row = element_to_line(element, settings.min_line_kv)
                 if row is None:
                     continue
@@ -183,14 +196,29 @@ def ingest_osm(connection, settings: Settings) -> tuple:
                     """,
                     (osm_id, max_kv, wkt),
                 )
-                line_total += 1
-        connection.commit()
-        time.sleep(2)
-    print(f"OSM rows written (before de-duplication across tiles): "
-          f"{substation_total} substations, {line_total} lines")
+            written += 1
+    mark_tile_done(connection, key)
+    connection.commit()
+    time.sleep(2)  # be polite to the public server
+    return written
+
+
+def ingest_osm(connection, settings: Settings) -> tuple:
+    south, west, north, east = state_bbox(connection, settings.state_fips)
+    tiles = make_tiles(south, west, north, east, settings.overpass_tiles)
+    substation_total = 0
+    line_total = 0
+    failed = []
+    for number, (t_south, t_west, t_north, t_east) in enumerate(tiles, start=1):
+        print(f"Tile {number}/{len(tiles)}")
+        bounds = dict(south=t_south, west=t_west, north=t_north, east=t_east)
+        substation_total += load_tile(connection, settings, "substations", number,
+                                      SUBSTATION_QUERY.format(**bounds), failed)
+        line_total += load_tile(connection, settings, "lines", number, LINE_QUERY.format(**bounds), failed)
+    print(f"OSM rows written this run: {substation_total} substations, {line_total} lines")
     if failed:
         print(f"WARNING: {len(failed)} tile queries failed and were skipped: {', '.join(failed)}")
-        print("Re-run the same command to retry; existing rows are upserted, not duplicated.")
-        if substation_total == 0 or line_total == 0:
-            raise RuntimeError("Overpass returned no substations or no lines; try again later.")
+        print("Re-run the same command: tiles that already succeeded are skipped, only these are retried.")
+    else:
+        print("All tile queries have succeeded.")
     return substation_total, line_total
