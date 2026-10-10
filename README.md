@@ -48,22 +48,39 @@ make build
 make up
 make smoke        # checks the PostGIS SQL against a tiny hand-made dataset
 make test         # unit tests
-make ingest       # downloads and loads real data; the OpenStreetMap step takes a while
+OVERPASS_TILES=8 STATE=NM make ingest   # downloads and loads real data; re-run until it says all tile queries succeeded
 open http://localhost:8000
 ```
+
+The public Overpass servers are often overloaded, so the OpenStreetMap step splits the state into tiles, detects timeouts that come back as HTTP 200, and records each successful tile in an `osm_tiles_done` table. A re-run skips finished tiles and retries only the failed ones.
 
 Change the state with `STATE=AZ make ingest` (and `STATE=AZ make up`). Set `ANTHROPIC_API_KEY` in your shell to enable Claude explanations. If the queue step fails on column names, run `docker compose run --rm app python -m ranker.ingest inspect-queue` and adjust `COLUMN_ALIASES` in `app/ranker/ingest/queue.py`.
 
 After the data is loaded, `make eval-explain` measures how often the first draft passes the number check.
 
-## Results (fill in only with measured numbers)
+## Status
+
+**Built and verified**
+- PostGIS feature SQL, checked by `make smoke` against a hand-made dataset with geodesic distances computed independently (all checks pass; it caught a real NULL bug in the withdrawn-share view).
+- 39 unit tests for scoring, ingest parsing, the explainer's number check and the API.
+- Real-data ingest for New Mexico: 33 counties from Census files and 626 queue rows from the LBNL workbook.
+
+**In progress**
+- OpenStreetMap coverage. Overpass tile queries still fail intermittently, so the substation and line counts are partial until a run prints that all tile queries succeeded.
+- Measuring the explainer (`make eval-explain`) and the ranking time.
+
+**Next**
+- Screenshot of the map, final README numbers, and a second state to show the pipeline is not hard-coded to one.
+
+## Results (filled in only with measured numbers)
 
 | Measure | Value |
 |---|---|
-| State | TBD |
-| Substations ranked | TBD |
+| State | New Mexico |
+| Counties loaded | 33 |
+| Queue rows loaded | 626 |
+| Substations ranked | TBD, ingest incomplete (568 loaded so far) |
 | Transmission lines loaded | TBD |
-| Queue rows loaded | TBD |
 | Ranking time for all candidates (API `rank_ms`) | TBD |
 | Explanations passing the number check on first draft (25 sites) | TBD |
 
