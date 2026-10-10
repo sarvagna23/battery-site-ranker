@@ -27,7 +27,11 @@ CREATE TABLE IF NOT EXISTS lines (
 CREATE INDEX IF NOT EXISTS lines_geom_idx ON lines USING gist (geom);
 -- Expression index so ST_DWithin on geography can use an index.
 CREATE INDEX IF NOT EXISTS lines_geog_idx ON lines USING gist ((geom::geography));
-
+-- Which OSM tile queries have already succeeded, so a re-run only retries the missing ones.
+CREATE TABLE IF NOT EXISTS osm_tiles_done (
+    tile_key TEXT PRIMARY KEY,
+    done_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS queue_projects (
     row_id      bigserial PRIMARY KEY,
     queue_id    text,
