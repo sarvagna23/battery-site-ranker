@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+psycopg[binary]
+httpx
+openpyxl
+pyshp
+shapely
+anthropic
+langgraph
+pyproj
+pytest

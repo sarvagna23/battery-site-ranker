@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Battery Site Ranker</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<style>
+  :root { --bg:#0f1419; --panel:#161d25; --line:#26313c; --text:#e6edf3; --muted:#8b98a5; --accent:#3ddc97; }
+  * { box-sizing: border-box; }
+  body { margin:0; height:100vh; display:flex; background:var(--bg); color:var(--text);
+         font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  aside { width:380px; max-width:42vw; overflow-y:auto; background:var(--panel); border-right:1px solid var(--line); padding:16px; }
+  #map { flex:1; }
+  h1 { font-size:18px; margin:0 0 2px; }
+  h2 { font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin:18px 0 8px; }
+  .sub { color:var(--muted); font-size:12px; }
+  .weight { margin:8px 0; }
+  .weight label { display:flex; justify-content:space-between; font-size:13px; }
+  .weight input { width:100%; accent-color:var(--accent); }
+  select { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:4px 8px; }
+  .row { display:flex; gap:12px; align-items:center; margin-top:8px; }
+  #list { list-style:none; margin:0; padding:0; }
+  #list li { display:flex; gap:10px; align-items:center; padding:7px 8px; border-radius:6px; cursor:pointer; }
+  #list li:hover, #list li.active { background:#1f2a35; }
+  .rank { width:26px; color:var(--muted); text-align:right; }
+  .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .score { font-variant-numeric:tabular-nums; font-weight:600; }
+  #detail { margin-top:14px; padding:12px; border:1px solid var(--line); border-radius:8px; display:none; }
+  .bar { height:6px; background:#26313c; border-radius:3px; overflow:hidden; margin:2px 0 8px; }
+  .bar span { display:block; height:100%; background:var(--accent); }
+  .contrib { font-size:12px; color:var(--muted); display:flex; justify-content:space-between; }
+  button { background:var(--accent); color:#06281a; border:0; border-radius:6px; padding:7px 12px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #explanation { margin-top:10px; }
+  .badge { display:inline-block; font-size:11px; padding:1px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); margin-bottom:6px; }
+  #status { color:var(--muted); font-size:12px; margin-top:8px; }
+  @media (max-width: 760px) { body { flex-direction:column-reverse; } aside { width:100%; max-width:none; height:55vh; } #map { height:45vh; flex:none; } }
+</style>
+</head>
+<body>
+<aside>
+  <h1>Battery Storage Site Ranker</h1>
+  <div class="sub" id="subtitle">Loading...</div>
+
+  <h2>Weights</h2>
+  <div id="weights"></div>
+  <div class="row">
+    <label>Show top <select id="top"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label>
+    <label>Min voltage <select id="minkv"><option value="69" selected>69 kV</option><option value="115">115 kV</option><option value="230">230 kV</option></select></label>
+  </div>
+  <div id="status"></div>
+
+  <h2>Ranked sites</h2>
+  <ul id="list"></ul>
+
+  <div id="detail">
+    <strong id="d-name"></strong>
+    <div class="sub" id="d-sub"></div>
+    <div id="d-contrib" style="margin-top:10px"></div>
+    <button id="explain-btn">Explain this site</button>
+    <div id="explanation"></div>
+  </div>
+</aside>
+<div id="map"></div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const state = { features: [], weights: {}, sites: [], selectedId: null };
+
+const map = new maplibregl.Map({
+  container: "map",
+  style: {
+    version: 8,
+    sources: { osm: { type: "raster", tileSize: 256, attribution: "© OpenStreetMap contributors",
+                      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"] } },
+    layers: [{ id: "osm", type: "raster", source: "osm" }]
+  },
+  center: [-98, 31], zoom: 5
+});
+map.addControl(new maplibregl.NavigationControl());
+
+function toGeoJSON(sites) {
+  return { type: "FeatureCollection", features: sites.map(s => ({
+    type: "Feature", geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+    properties: { id: s.id, rank: s.rank, score: s.score, name: s.name || "Unnamed substation" } })) };
+}
+
+map.on("load", () => {
+  map.addSource("sites", { type: "geojson", data: toGeoJSON([]) });
+  map.addLayer({ id: "sites", type: "circle", source: "sites", paint: {
+    "circle-radius": ["interpolate", ["linear"], ["get", "score"], 0, 5, 100, 14],
+    "circle-color": ["interpolate", ["linear"], ["get", "score"], 30, "#f5a524", 60, "#c8e04a", 85, "#3ddc97"],
+    "circle-stroke-width": 1.5, "circle-stroke-color": "#0f1419", "circle-opacity": 0.9 } });
+  map.on("click", "sites", e => selectSite(e.features[0].properties.id));
+  map.on("mouseenter", "sites", () => map.getCanvas().style.cursor = "pointer");
+  map.on("mouseleave", "sites", () => map.getCanvas().style.cursor = "");
+  init();
+});
+
+async function init() {
+  state.features = await (await fetch("/features")).json();
+  for (const f of state.features) state.weights[f.key] = f.default_weight;
+  renderWeights();
+  await refresh(true);
+}
+
+function renderWeights() {
+  const box = document.getElementById("weights");
+  box.innerHTML = "";
+  for (const f of state.features) {
+    const wrap = document.createElement("div");
+    wrap.className = "weight";
+    wrap.innerHTML = `<label><span>${f.label}</span><span id="wv-${f.key}">${state.weights[f.key].toFixed(2)}</span></label>
+      <input type="range" min="0" max="1" step="0.05" value="${state.weights[f.key]}" data-key="${f.key}">`;
+    box.appendChild(wrap);
+  }
+  box.querySelectorAll("input").forEach(input => input.addEventListener("input", () => {
+    state.weights[input.dataset.key] = parseFloat(input.value);
+    document.getElementById("wv-" + input.dataset.key).textContent = parseFloat(input.value).toFixed(2);
+    debounceRefresh();
+  }));
+}
+
+let timer = null;
+function debounceRefresh() { clearTimeout(timer); timer = setTimeout(() => refresh(false), 250); }
+document.getElementById("top").addEventListener("change", () => refresh(false));
+document.getElementById("minkv").addEventListener("change", () => refresh(false));
+
+async function refresh(fit) {
+  const params = new URLSearchParams({
+    top: document.getElementById("top").value, min_kv: document.getElementById("minkv").value });
+  for (const [key, value] of Object.entries(state.weights)) params.set("w_" + key, value);
+  const status = document.getElementById("status");
+  const response = await fetch("/sites?" + params);
+  if (!response.ok) { status.textContent = (await response.json()).detail || "Request failed"; return; }
+  const data = await response.json();
+  state.sites = data.sites;
+  document.getElementById("subtitle").textContent = `${data.state}: ${data.candidates} candidate substations`;
+  status.textContent = data.candidates ? `Ranked in ${data.rank_ms} ms` : "No data yet. Run the ingest steps first.";
+  map.getSource("sites").setData(toGeoJSON(data.sites));
+  renderList();
+  if (fit && data.sites.length) {
+    const bounds = new maplibregl.LngLatBounds();
+    data.sites.forEach(s => bounds.extend([s.lon, s.lat]));
+    map.fitBounds(bounds, { padding: 60, maxZoom: 9 });
+  }
+  if (state.selectedId) showDetail(state.sites.find(s => s.id === state.selectedId));
+}
+
+function renderList() {
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+  for (const site of state.sites) {
+    const item = document.createElement("li");
+    if (site.id === state.selectedId) item.className = "active";
+    // Names come from OpenStreetMap, so they are inserted as text, never as HTML.
+    const rank = document.createElement("span");
+    rank.className = "rank"; rank.textContent = site.rank;
+    const name = document.createElement("span");
+    name.className = "name"; name.textContent = site.name || "Unnamed substation";
+    const detail = document.createElement("span");
+    detail.className = "sub"; detail.textContent = ` ${site.county || ""} · ${site.features.max_kv} kV`;
+    name.appendChild(detail);
+    const score = document.createElement("span");
+    score.className = "score"; score.textContent = site.score;
+    item.append(rank, name, score);
+    item.addEventListener("click", () => selectSite(site.id));
+    list.appendChild(item);
+  }
+}
+
+function selectSite(id) {
+  state.selectedId = id;
+  const site = state.sites.find(s => s.id === id);
+  if (!site) return;
+  map.flyTo({ center: [site.lon, site.lat], zoom: Math.max(map.getZoom(), 9) });
+  renderList();
+  showDetail(site);
+}
+
+function showDetail(site) {
+  if (!site) { document.getElementById("detail").style.display = "none"; return; }
+  document.getElementById("detail").style.display = "block";
+  document.getElementById("d-name").textContent = `#${site.rank} ${site.name || "Unnamed substation"}`;
+  document.getElementById("d-sub").textContent = `${site.county || ""} County · score ${site.score} / 100`;
+  const maxPoints = Math.max(...Object.values(site.contributions), 1);
+  document.getElementById("d-contrib").innerHTML = state.features.map(f => {
+    const points = site.contributions[f.key];
+    const note = site.imputed.includes(f.key) ? " (no data)" : "";
+    return `<div class="contrib"><span>${f.label}${note}</span><span>${points}</span></div>
+            <div class="bar"><span style="width:${(points / maxPoints) * 100}%"></span></div>`;
+  }).join("");
+  document.getElementById("explanation").innerHTML = "";
+  const button = document.getElementById("explain-btn");
+  button.disabled = false;
+  button.onclick = () => explain(site.id);
+}
+
+async function explain(id) {
+  const button = document.getElementById("explain-btn");
+  button.disabled = true;
+  const target = document.getElementById("explanation");
+  target.textContent = "Writing...";
+  const response = await fetch(`/sites/${encodeURIComponent(id).replace(/%2F/g, "/")}/explain`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ weights: state.weights, min_kv: parseFloat(document.getElementById("minkv").value) }) });
+  if (!response.ok) { target.textContent = "Could not explain this site."; button.disabled = false; return; }
+  const result = await response.json();
+  const label = result.mode === "llm" ? "Claude, numbers verified against the data"
+              : result.mode === "template" ? "Template (no API key set)" : "Template fallback after failed check";
+  target.innerHTML = `<span class="badge">${label}</span><div></div>`;
+  target.lastChild.textContent = result.explanation;
+  button.disabled = false;
+}
+</script>
+</body>
+</html>

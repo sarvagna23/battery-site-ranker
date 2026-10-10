@@ -1,0 +1,39 @@
+# Local setup. The database password below is a throwaway value for this demo only.
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    platform: linux/amd64        # the image has no arm64 build; Docker Desktop emulates it on Apple Silicon
+    environment:
+      POSTGRES_USER: ranker
+      POSTGRES_PASSWORD: ranker
+      POSTGRES_DB: ranker
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ranker -d ranker"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://ranker:ranker@db:5432/ranker
+      STATE: ${STATE:-TX}
+      OVERPASS_TILES: ${OVERPASS_TILES:-4}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      EXPLAIN_MODE: ${EXPLAIN_MODE:-auto}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data              # cached downloads (county shapes, queue workbook)
+
+volumes:
+  pgdata:
